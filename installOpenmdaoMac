@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -e
+
+# first steps:
+
+# 1 - Install Anaconda Python
+# go to https://www.anaconda.com/distribution/
+# download Anaconda3-2019.10-MacOSX-x86_64.pkg
+# run it
+# optionally get PyCharm for Anaconda here: https://www.jetbrains.com/pycharm/promo/anaconda
+# set conda environment name to use for this installation here (it will be deleted and re-built):
+export CONDAENV=openmdao
+# an existing Anconda installation can also be updated:
+#   conda update -n base -c defaults conda
+
+# 2 - clone OpenMDAO repositories on GitHub
+# go to https://github.com, log into your account, and clone the two needed repos to your account:
+#   https://github.com/OpenMDAO/OpenMDAO
+#   https://github.com/OpenMDAO/dymos
+# Git workflow:
+#   1 - Work on code changes locally
+#   2 - Push them to 'origin' (your GitHub fork) when you are ready to share work
+#   3 - Do pull request to original ('upstream') repos on GitHub when ready to merge
+# set your GitHub user name here:
+export GITHUBUSER=wright
+
+# 3- obtain SNOPT source code (not open source) and extract it somewhere
+# specify where here:
+export SNOPTSOURCE=~/languages/snopt75
+
+# 4 - specify the directory where you want the local repos to be created:
+export REPOS=~/repos
+
+# 5 - install gfortran using Homebrew for compiling pyoptsparse with SNOPT support, see https://brew.sh
+#   brew cask install gfortran
+
+# delete old installations:
+cd ${REPOS}
+rm -rf OpenMDAO.git
+rm -rf dymos
+
+# delete and rebuild conda environment
+eval "$(conda shell.bash hook)"  # enable conda commands in this bash script
+conda deactivate
+conda env remove --yes --name ${CONDAENV}
+conda create --yes -n ${CONDAENV} python=3.7 anaconda
+conda activate ${CONDAENV}
+conda env list  # show environments; the current one will have an asterisk and should be ${CONDAENV}
+
+# install additional conda packages
+conda install --yes cython sphinx mock swig pip
+conda install --yes -c conda-forge petsc4py mpi4py  # petsc4py is required for MPI, but not available in the standard conda channel
+
+# install pip packages
+pip install --upgrade pip;
+pip install numpy==1.17.1;
+pip install scipy==1.2.0;
+pip install matplotlib;
+pip install nose;
+pip install networkx;
+pip install testflo==1.3.6;
+pip install pyyaml;
+pip install coveralls;
+pip install --user travis-sphinx;
+pip install sqlitedict;  # needed for Feb 2020 pyoptsparse
+
+# clone OpenMDAO from your GitHub fork
+cd ${REPOS}
+git clone https://github.com/${GITHUBUSER}/OpenMDAO.git ./OpenMDAO.git
+cd OpenMDAO.git
+git remote add upstream https://github.com/OpenMDAO/OpenMDAO.git
+git pull upstream master
+pip install -e .[all]
+
+# clone Dymos from your GitHub fork
+cd ${REPOS}
+git clone https://github.com/${GITHUBUSER}/dymos.git ./dymos
+cd dymos
+git remote add upstream https://github.com/OpenMDAO/dymos.git
+git remote add rob https://github.com/robfalck/dymos  # optionally add other team members to get their unmerged commits
+git pull upstream master
+pip install -e .
+
+# use Dymos script to install pyoptspare with SNOPT and IPOPT support
+#   remove "-s ${SNOPTSOURCE}/src" to compile without SNOPT
+cd ${REPOS}
+rm -rf ${REPOS}/Ipopt*
+rm -rf ${REPOS}/ThirdParty-Metis*
+rm -rf ${REPOS}/ThirdParty-Mumps*
+rm -rf ${REPOS}/pyoptsparse*
+rm -rf ${REPOS}/temp
+chmod 755 dymos/build_pyoptsparse_ipopt.sh
+dymos/build_pyoptsparse_ipopt.sh -p ${REPOS}/temp -s ${SNOPTSOURCE}/src
+
+# old way: clone pyoptsparse and install with SNOPT support
+#cd ${REPOS}
+#git clone https://github.com/mdolab/pyoptsparse.git ./pyoptsparse.git
+#cd pyoptsparse.git
+#git checkout v1.2
+## copy SNOPT fortran source files (except snopth.f) to the pySNOPT folder
+#cp ${SNOPTSOURCE}/src/*.f pyoptsparse/pySNOPT/source
+#mv pyoptsparse/pySNOPT/source/snopth.f pyoptsparse/pySNOPT/source/snopth.f.bak
+#python setup.py build install
+
+# if necessary, try to get rid of persistant OS X firewall pop-up dialog boxes for MPI
+#sudo codesign --force --sign -  `which orted`
+#sudo codesign --force --sign -  `which orterun`
+
+# run some tests to make sure installation is good
+
+cd ${REPOS}
+# test OpenMDAO including SNOPT
+python << END
+import openmdao.api as om
+
+# build the model
+prob = om.Problem()
+
+indeps = prob.model.add_subsystem('indeps', om.IndepVarComp())
+indeps.add_output('x', 3.0)
+indeps.add_output('y', -4.0)
+
+prob.model.add_subsystem('paraboloid', om.ExecComp('f = (x-3)**2 + x*y + (y+4)**2 - 3'))
+
+prob.model.connect('indeps.x', 'paraboloid.x')
+prob.model.connect('indeps.y', 'paraboloid.y')
+
+# setup the optimization
+#prob.driver = om.ScipyOptimizeDriver()
+#prob.driver.options['optimizer'] = 'SLSQP'
+# enable SNOPT ----------
+prob.driver = om.pyOptSparseDriver()
+prob.driver.options['optimizer'] = 'SNOPT'
+prob.driver.opt_settings['iSumm'] = 6
+# -----------------------
+
+prob.model.add_design_var('indeps.x', lower=-50, upper=50)
+prob.model.add_design_var('indeps.y', lower=-50, upper=50)
+prob.model.add_objective('paraboloid.f')
+
+prob.setup()
+prob.run_driver()
+
+# minimum value
+print('minimum\n', prob['paraboloid.f'])
+
+# location of the minimum
+print('indeps.x\n', prob['indeps.x'])
+print('indeps.y\n', prob['indeps.y'])
+END
+
+# test MPI
+# this is required, but not obvious:
+export OPENMDAO_REQUIRE_MPI=1
+
+echo "##### running MPI unit test"
+python ${REPOS}/OpenMDAO.git/openmdao/vectors/tests/test_vector.py
+# only 3 of 6 were passing by default (see fixes below)
+# tests are skipped due to: @unittest.skipUnless(MPI and PETScVector, "only run with MPI and PETSc.")
+# neither of these seems to be configured without changes:
+
+echo "##### testing MPI import"
+# fixed by setting OPENMDAO_REQUIRE_MPI=1 environment variable (avoids being forced to 'None' by MPI.COMM_WORLD.size==1 check), test:
+python << END
+from openmdao.utils.mpi import MPI
+print(MPI)
+print(MPI != None)
+END
+
+echo "##### testing PETScVector import"
+# fixed by installing petsc4py via conda-forge, test:
+python << END
+try:
+    from openmdao.parallel_api import PETScVector
+except ImportError:
+    PETScVector = None
+print(PETScVector)
+print(PETScVector != None)
+END
+
+echo "You can run all the Dymos unit tests using testflo (skipping for now):"
+echo "  testflo -n 1 --pre_announce dymos"
+
+echo "Run the following when this script finishes to use the newly installed enviroment:"
+echo "  conda activate ${CONDAENV}"
+echo "  export OPENMDAO_REQUIRE_MPI=1"
+
+# additional notes:
+
+# - How to test documentation building? Watch for (non-MPI) errors in build output for things I have changed.
+#    cd ${REPOS}/OpenMDAO.git/openmdao/docs && make clean && make all && open _build/html/index.html
+
+# - How to do issue tracking?
+#    https://github.com/OpenMDAO/dymos/projects/10
+
+# - How to run single unit tests locally? Also you can set "default test runner" to "Unittests" in PyCharm and right click to run
+#      python unitTestFileName unitTestClassName.unitTestFunctionName
+#    or in test file:
+#      unittest.main(verbosity=2, defaultTest='TestSimpleGA.test_simple_test_func
+#    or just run the PEP 8 test to look for code formating issues:
+#      testflo ${REPOS}/dymos/dymos/test/test_pep8.py
+
+# - Is it possible to run Travis checks locally, or from my Github fork before submitting a merge request?
+#  see, for example dymos/.travis.yml (testflo runs all tests below current directory):
+#      testflo -n 1 dymos --pre_announce --coverage --coverpkg dymos;
+#      testflo -b -n 1 --pre_announce   # benchmark directory tests
+#      python openmdao/code_review/test_lint_peps.py
+#      python openmdao/code_review/test_lint_docstrings.py
+#      python openmdao/code_review/test_lint_attributes.py
+#  you can enable Travis testing on commits pushed to your GitHub master branch:
+#      https://travis-ci.org/account/repositories
+#      if you've logged into travis with your github account, you should be able to enable travis testing there
+
+# - How is a MPI problem normally run? example:
+#     mpirun -n 3 python ${REPOS}/dymos/dymos/examples/finite_burn_orbit_raise/test/test_ex_two_burn_orbit_raise.py TestExampleTwoBurnOrbitRaiseMPI.test_ex_two_burn_orbit_raise
