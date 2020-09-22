@@ -5,13 +5,14 @@ set -e
 
 # 1 - Install Anaconda Python
 # go to https://www.anaconda.com/distribution/
-# download Anaconda3-2019.10-MacOSX-x86_64.pkg
-# run it
-# optionally get PyCharm for Anaconda here: https://www.jetbrains.com/pycharm/promo/anaconda
+# download Anaconda3-2020.07-MacOSX-x86_64.sh
+# run it:
+#   bash ~/Downloads/Anaconda3-2020.07-MacOSX-x86_64.sh -b
+#   conda init bash
+#   then exit and restart your shell
+# optionally, additionally get PyCharm for Anaconda here: https://www.jetbrains.com/pycharm/promo/anaconda
 # set conda environment name to use for this installation here (it will be deleted and re-built):
 export CONDAENV=openmdao
-# an existing Anconda installation can also be updated:
-#   conda update -n base -c defaults conda
 
 # 2 - clone OpenMDAO repositories on GitHub
 # go to https://github.com, log into your account, and clone the two needed repos to your account:
@@ -26,14 +27,18 @@ export CONDAENV=openmdao
 export GITHUBUSER=wright
 
 # 3- obtain SNOPT source code (not open source) and extract it somewhere
-# specify where here:
-export SNOPTSOURCE=~/languages/snopt75
+# specify where here (relative to REPOS directory) [note SNOPT 7.5 had issues with XCode 12]:
+export SNOPTSOURCE=../languages/snopt771
 
 # 4 - specify the directory where you want the local repos to be created:
 export REPOS=~/repos
 
-# 5 - install gfortran using Homebrew for compiling pyoptsparse with SNOPT support, see https://brew.sh
-#   brew cask install gfortran
+# 5 - install OpenMPI and gfortran (part of gcc) using Homebrew
+# see https://brew.sh for Homebrew installation
+#   brew install openmpi gcc
+
+# 6 - make sure Xcode is installed and selected
+#   sudo xcode-select -s /Applications/Xcode.app
 
 # delete old installations:
 cd ${REPOS}
@@ -50,12 +55,14 @@ conda env list  # show environments; the current one will have an asterisk and s
 
 # install additional conda packages
 conda install --yes cython sphinx mock swig pip
-conda install --yes -c conda-forge petsc4py mpi4py  # petsc4py is required for MPI, but not available in the standard conda channel
 
 # install pip packages
 pip install --upgrade pip;
-pip install numpy==1.17.1;
-pip install scipy==1.2.0;
+pip install numpy==1.18.1;  # downgrade
+pip install scipy==1.4.1;   # downgrade
+pip install mpi4py;  # don't use Anaconda's mpi, use Homebrew's
+pip install petsc;   # expect "Building wheel" to fail, then it will eventually build a different way and succeed
+pip install petsc4py;
 pip install matplotlib;
 pip install nose;
 pip install networkx;
@@ -71,7 +78,7 @@ cd ${REPOS}
 git clone https://github.com/${GITHUBUSER}/OpenMDAO.git ./OpenMDAO.git
 cd OpenMDAO.git
 git remote add upstream https://github.com/OpenMDAO/OpenMDAO.git
-git pull upstream master
+git fetch upstream
 pip install -e .[all]
 
 # clone Dymos from your GitHub fork
@@ -80,38 +87,42 @@ git clone https://github.com/${GITHUBUSER}/dymos.git ./dymos
 cd dymos
 git remote add upstream https://github.com/OpenMDAO/dymos.git
 git remote add rob https://github.com/robfalck/dymos  # optionally add other team members to get their unmerged commits
-git pull upstream master
+git fetch upstream
 pip install -e .
 
-# use Dymos script to install pyoptspare with SNOPT and IPOPT support
-#   remove "-s ${SNOPTSOURCE}/src" to compile without SNOPT
+# use OpenMDAO script to install pyoptspare with SNOPT and IPOPT support
 cd ${REPOS}
 rm -rf ${REPOS}/Ipopt*
 rm -rf ${REPOS}/ThirdParty-Metis*
 rm -rf ${REPOS}/ThirdParty-Mumps*
 rm -rf ${REPOS}/pyoptsparse*
-rm -rf ${REPOS}/temp
-chmod 755 dymos/build_pyoptsparse_ipopt.sh
-dymos/build_pyoptsparse_ipopt.sh -p ${REPOS}/temp -s ${SNOPTSOURCE}/src
+rm -rf ${REPOS}/ipoptInstall  # this directory must be kept unless re-installing
+rm -rf ${REPOS}/build_pyoptsparse
+git clone https://github.com/OpenMDAO/build_pyoptsparse.git
 
-# old way: clone pyoptsparse and install with SNOPT support
-#cd ${REPOS}
-#git clone https://github.com/mdolab/pyoptsparse.git ./pyoptsparse.git
-#cd pyoptsparse.git
-#git checkout v1.2
-## copy SNOPT fortran source files (except snopth.f) to the pySNOPT folder
-#cp ${SNOPTSOURCE}/src/*.f pyoptsparse/pySNOPT/source
-#mv pyoptsparse/pySNOPT/source/snopth.f pyoptsparse/pySNOPT/source/snopth.f.bak
-#python setup.py build install
+./build_pyoptsparse/build_pyoptsparse.sh -p ${REPOS}/ipoptInstall -s ${SNOPTSOURCE}/src
 
-# if necessary, try to get rid of persistant OS X firewall pop-up dialog boxes for MPI
-#sudo codesign --force --sign -  `which orted`
-#sudo codesign --force --sign -  `which orterun`
+# clean up
+rm -rf ${REPOS}/Ipopt*
+rm -rf ${REPOS}/ThirdParty-Metis*
+rm -rf ${REPOS}/ThirdParty-Mumps*
+rm -rf ${REPOS}/pyoptsparse*
+rm -rf ${REPOS}/build_pyoptsparse
+
+# OSX might have annoying firewall pop-up dialog boxes for each test.
+# This can be fixed by using "Keychain Access" to create a personal signing certificate
+# and then using the "codesign" program to sign the program it is complaining about, i.e.:
+#   codesign -s "My Certificate" -f $(which python)
 
 # run some tests to make sure installation is good
 
 cd ${REPOS}
+
+# force MPI off
+unset OPENMDAO_REQUIRE_MPI
+
 # test OpenMDAO including SNOPT
+echo "##### OpenMDAO unit test"
 python << END
 import openmdao.api as om
 
@@ -157,12 +168,8 @@ export OPENMDAO_REQUIRE_MPI=1
 
 echo "##### running MPI unit test"
 python ${REPOS}/OpenMDAO.git/openmdao/vectors/tests/test_vector.py
-# only 3 of 6 were passing by default (see fixes below)
-# tests are skipped due to: @unittest.skipUnless(MPI and PETScVector, "only run with MPI and PETSc.")
-# neither of these seems to be configured without changes:
 
 echo "##### testing MPI import"
-# fixed by setting OPENMDAO_REQUIRE_MPI=1 environment variable (avoids being forced to 'None' by MPI.COMM_WORLD.size==1 check), test:
 python << END
 from openmdao.utils.mpi import MPI
 print(MPI)
@@ -170,7 +177,6 @@ print(MPI != None)
 END
 
 echo "##### testing PETScVector import"
-# fixed by installing petsc4py via conda-forge, test:
 python << END
 try:
     from openmdao.parallel_api import PETScVector
